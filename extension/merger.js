@@ -2,6 +2,20 @@ import { FFmpeg } from "./ffmpeg/index.js";
 
 let ffmpegPromise;
 
+function createAbortError() {
+  return new DOMException("Merge stopped.", "AbortError");
+}
+
+function resetFFmpegPromise() {
+  ffmpegPromise = undefined;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : createAbortError();
+  }
+}
+
 async function loadFFmpeg() {
   const ffmpeg = new FFmpeg();
   const baseUrl = chrome.runtime.getURL("ffmpeg/");
@@ -17,7 +31,10 @@ async function loadFFmpeg() {
 
 function getFFmpeg() {
   if (!ffmpegPromise) {
-    ffmpegPromise = loadFFmpeg();
+    ffmpegPromise = loadFFmpeg().catch((error) => {
+      resetFFmpegPromise();
+      throw error;
+    });
   }
 
   return ffmpegPromise;
@@ -31,8 +48,10 @@ async function safeDelete(ffmpeg, filePath) {
   }
 }
 
-export async function mergeAV(videoBlob, audioBlob, { onLog, onProgress } = {}) {
+export async function mergeAV(videoBlob, audioBlob, { onLog, onProgress, signal } = {}) {
+  throwIfAborted(signal);
   const ffmpeg = await getFFmpeg();
+  throwIfAborted(signal);
 
   const logHandler = onLog
     ? ({ message, type }) => {
@@ -53,6 +72,15 @@ export async function mergeAV(videoBlob, audioBlob, { onLog, onProgress } = {}) 
     ffmpeg.on("progress", progressHandler);
   }
 
+  const abortHandler = () => {
+    ffmpeg.terminate();
+    resetFFmpegPromise();
+  };
+
+  if (signal) {
+    signal.addEventListener("abort", abortHandler, { once: true });
+  }
+
   try {
     await Promise.all([
       safeDelete(ffmpeg, "video.mp4"),
@@ -64,9 +92,10 @@ export async function mergeAV(videoBlob, audioBlob, { onLog, onProgress } = {}) 
       videoBlob.arrayBuffer(),
       audioBlob.arrayBuffer(),
     ]);
+    throwIfAborted(signal);
 
-    await ffmpeg.writeFile("video.mp4", new Uint8Array(videoBytes));
-    await ffmpeg.writeFile("audio.m4a", new Uint8Array(audioBytes));
+    await ffmpeg.writeFile("video.mp4", new Uint8Array(videoBytes), { signal });
+    await ffmpeg.writeFile("audio.m4a", new Uint8Array(audioBytes), { signal });
 
     const exitCode = await ffmpeg.exec([
       "-i",
@@ -76,13 +105,13 @@ export async function mergeAV(videoBlob, audioBlob, { onLog, onProgress } = {}) 
       "-c",
       "copy",
       "out.mp4",
-    ]);
+    ], -1, { signal });
 
     if (exitCode !== 0) {
       throw new Error(`ffmpeg exited with code ${exitCode}`);
     }
 
-    const output = await ffmpeg.readFile("out.mp4");
+    const output = await ffmpeg.readFile("out.mp4", "binary", { signal });
     return new Blob([output], { type: "video/mp4" });
   } finally {
     await Promise.all([
@@ -98,5 +127,7 @@ export async function mergeAV(videoBlob, audioBlob, { onLog, onProgress } = {}) 
     if (progressHandler) {
       ffmpeg.off("progress", progressHandler);
     }
+
+    signal?.removeEventListener("abort", abortHandler);
   }
 }

@@ -1,22 +1,50 @@
 const STRIP_PARAMS = new Set(["range", "rn", "rbuf", "ump", "srfvp", "alr"]);
 const STREAM_FILTER = {
-  urls: ["<all_urls>"],
+  urls: [
+    "*://*.googlevideo.com/*",
+    "*://*.c.drive.google.com/*",
+    "*://*.googleusercontent.com/*",
+  ],
 };
 
 const capturedByTab = new Map();
 const DEBUG = false;
+
+function sanitizeLogDetails(details) {
+  if (!details || Array.isArray(details) || typeof details !== "object") {
+    return details;
+  }
+
+  const filtered = Object.fromEntries(
+    Object.entries(details).filter(([, value]) => {
+      if (value === "" || value === null || value === undefined) {
+        return false;
+      }
+
+      if (Array.isArray(value) && value.length === 0) {
+        return false;
+      }
+
+      return true;
+    }),
+  );
+
+  return Object.keys(filtered).length ? filtered : undefined;
+}
 
 function debugLog(message, details) {
   if (!DEBUG) {
     return;
   }
 
-  if (details === undefined) {
+  const sanitized = sanitizeLogDetails(details);
+
+  if (sanitized === undefined) {
     console.log("[Drive Video Downloader]", message);
     return;
   }
 
-  console.log("[Drive Video Downloader]", message, details);
+  console.log("[Drive Video Downloader]", message, sanitized);
 }
 
 function parseSize(value) {
@@ -184,6 +212,12 @@ function onBeforeRequest(details) {
     if (isBetterCandidate(current.video, stream)) {
       current.video = stream;
     }
+
+    debugLog("Stored stream candidate for tab.", {
+      kind,
+      summary: summarizeCapture(current),
+      tabId: details.tabId,
+    });
 
     capturedByTab.set(details.tabId, current);
     return;
