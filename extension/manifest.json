@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Drive Video Downloader",
+  "version": "1.0.0",
+  "description": "Download Google Drive viewer streams as audio, video, or a merged MP4.",
+  "permissions": [
+    "activeTab",
+    "declarativeNetRequestWithHostAccess",
+    "downloads",
+    "sidePanel",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Drive Video Downloader"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "origin_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src https://drive.google.com https://*.drive.google.com https://*.googleusercontent.com https://*.googlevideo.com https://*.c.drive.google.com"
+  }
+}

@@ -1,0 +1,108 @@
+name: Build Extension
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/build-extension.yml"
+      - "extension/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/**"
+  pull_request:
+    paths:
+      - ".github/workflows/build-extension.yml"
+      - "extension/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-extension-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build extension
+        run: npm run build
+
+      - name: Read package version
+        id: package
+        run: echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release metadata
+        id: release
+        run: |
+          echo "tag=latest-${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "title=Latest ${GITHUB_REF_NAME} build" >> "$GITHUB_OUTPUT"
+          echo "asset=drive-video-downloader-${GITHUB_REF_NAME}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Create zip artifact
+        run: |
+          cd dist
+          zip -r "drive-video-downloader-${{ steps.package.outputs.version }}.zip" drive-video-downloader
+
+      - name: Prepare release zip
+        if: github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')
+        run: |
+          cp \
+            "dist/drive-video-downloader-${{ steps.package.outputs.version }}.zip" \
+            "dist/${{ steps.release.outputs.asset }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drive-video-downloader-${{ steps.package.outputs.version }}
+          path: dist/drive-video-downloader-${{ steps.package.outputs.version }}.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_ASSET: ${{ steps.release.outputs.asset }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          BODY=$(cat <<EOF
+          Automated rolling build for branch ${GITHUB_REF_NAME}.
+
+          Package version: ${PACKAGE_VERSION}
+          Commit: ${GITHUB_SHA}
+          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$BODY"
+            gh release upload "$RELEASE_TAG" "dist/$RELEASE_ASSET" --clobber
+          else
+            gh release create "$RELEASE_TAG" "dist/$RELEASE_ASSET" \
+              --title "$RELEASE_TITLE" \
+              --notes "$BODY" \
+              --target "$GITHUB_SHA"
+          fi
