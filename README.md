@@ -22,11 +22,11 @@ The extension:
 If you do not want to build locally:
 
 1. Open the repository `Releases` section on GitHub.
-2. Open the latest release for `main` or `master`.
+2. Open the latest versioned release. Each push to `master` creates the next release automatically: `v1.0`, `v1.1`, `v1.2`, and so on.
 3. Download the attached zip named like:
 
    ```text
-   drive-video-downloader-main.zip
+   drive-video-downloader-v1.0.zip
    ```
 
 4. Unzip it.
@@ -42,7 +42,7 @@ If you want a build from a workflow run that was not published as a release:
 3. Download the artifact named like:
 
    ```text
-   drive-video-downloader-1.0.0
+   drive-video-downloader-42
    ```
 
 4. Unzip it.
@@ -81,7 +81,7 @@ If you want a build from a workflow run that was not published as a release:
 ## Technical Details
 
 Why the Origin/Referer rewrite?
-Google Drive's own video player already sends `Origin: https://youtube.googleapis.com` and `Referer: https://youtube.googleapis.com/` on its media fetch requests — this is Drive's own behavior, not something invented here. When the extension fetches the same URLs directly, the request arrives from a different origin and Google's servers respond with a `403` or severely throttled bandwidth. `rules.json` replicates the exact same header shape Drive already uses, so the server treats the extension's requests the same way it treats the player's requests. The rule is narrowly scoped: it only applies to `media` and `xmlhttprequest` resource types matching `/videoplayback` on `googlevideo.com` and `c.drive.google.com`. No other traffic is affected.
+Google Drive's own video player already sends `Origin: https://youtube.googleapis.com` and `Referer: https://youtube.googleapis.com/` on its media fetch requests - this is Drive's own behavior, not something invented here. When the extension fetches the same URLs directly, the request arrives from a different origin and Google's servers respond with a `403` or severely throttled bandwidth. `rules.json` replicates the exact same header shape Drive already uses, so the server treats the extension's requests the same way it treats the player's requests. The rule is narrowly scoped: it only applies to `media` and `xmlhttprequest` resource types matching `/videoplayback` on `googlevideo.com` and `c.drive.google.com`. No other traffic is affected.
 
 ## Legal Disclaimer
 
