@@ -2,37 +2,24 @@ name: Build Extension
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches:
-      - main
       - master
-    paths:
-      - ".github/workflows/build-extension.yml"
-      - "extension/**"
-      - "package-lock.json"
-      - "package.json"
-      - "scripts/**"
-  pull_request:
-    paths:
-      - ".github/workflows/build-extension.yml"
-      - "extension/**"
-      - "package-lock.json"
-      - "package.json"
-      - "scripts/**"
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-extension-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-extension
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Node.js
@@ -47,62 +34,80 @@ jobs:
       - name: Build extension
         run: npm run build
 
-      - name: Read package version
-        id: package
-        run: echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare release metadata
-        id: release
-        run: |
-          echo "tag=latest-${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          echo "title=Latest ${GITHUB_REF_NAME} build" >> "$GITHUB_OUTPUT"
-          echo "asset=drive-video-downloader-${GITHUB_REF_NAME}.zip" >> "$GITHUB_OUTPUT"
-
-      - name: Create zip artifact
-        run: |
-          cd dist
-          zip -r "drive-video-downloader-${{ steps.package.outputs.version }}.zip" drive-video-downloader
-
-      - name: Prepare release zip
-        if: github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')
-        run: |
-          cp \
-            "dist/drive-video-downloader-${{ steps.package.outputs.version }}.zip" \
-            "dist/${{ steps.release.outputs.asset }}"
-
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: drive-video-downloader-${{ steps.package.outputs.version }}
-          path: dist/drive-video-downloader-${{ steps.package.outputs.version }}.zip
+          name: drive-video-downloader-${{ github.run_number }}
+          path: dist/drive-video-downloader
           if-no-files-found: error
 
-      - name: Publish GitHub release
-        if: github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_TITLE: ${{ steps.release.outputs.title }}
-          RELEASE_ASSET: ${{ steps.release.outputs.asset }}
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+      - name: Create release archive
         run: |
-          BODY=$(cat <<EOF
-          Automated rolling build for branch ${GITHUB_REF_NAME}.
+          cd dist
+          zip -r ../drive-video-downloader.zip drive-video-downloader
 
-          Package version: ${PACKAGE_VERSION}
-          Commit: ${GITHUB_SHA}
-          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-          EOF
-          )
+      - name: Determine release version
+        if: github.event_name == 'push' && github.ref_name == 'master'
+        id: release_meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > releases.json
+          node <<'NODE'
+          const fs = require("fs");
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" \
-              --title "$RELEASE_TITLE" \
-              --notes "$BODY"
-            gh release upload "$RELEASE_TAG" "dist/$RELEASE_ASSET" --clobber
+          const pages = JSON.parse(fs.readFileSync("releases.json", "utf8"));
+          const releases = pages.flat();
+          const versionPattern = /^v?1\.(\d+)$/;
+          const sha = process.env.GITHUB_SHA;
+
+          const existing = releases.find((release) => {
+            return versionPattern.test(release.tag_name || "") && release.target_commitish === sha;
+          });
+
+          let version;
+          if (existing) {
+            version = (existing.tag_name || "").replace(/^v/, "");
+          } else {
+            let maxMinor = -1;
+            for (const release of releases) {
+              const match = versionPattern.exec(release.tag_name || "");
+              if (!match) {
+                continue;
+              }
+              maxMinor = Math.max(maxMinor, Number.parseInt(match[1], 10));
+            }
+            version = `1.${maxMinor + 1}`;
+          }
+
+          const lines = [
+            `version=${version}`,
+            `tag=v${version}`,
+            `title=Release v${version}`,
+            `asset=drive-video-downloader-v${version}.zip`,
+          ];
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `${lines.join("\n")}\n`);
+          NODE
+
+      - name: Prepare release asset
+        if: steps.release_meta.outputs.asset != ''
+        run: mv drive-video-downloader.zip "${{ steps.release_meta.outputs.asset }}"
+
+      - name: Publish GitHub release
+        if: steps.release_meta.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          tag="${{ steps.release_meta.outputs.tag }}"
+          title="${{ steps.release_meta.outputs.title }}"
+          asset="${{ steps.release_meta.outputs.asset }}"
+
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --target "$GITHUB_SHA"
+            gh release upload "$tag" "$asset" --clobber
           else
-            gh release create "$RELEASE_TAG" "dist/$RELEASE_ASSET" \
-              --title "$RELEASE_TITLE" \
-              --notes "$BODY" \
-              --target "$GITHUB_SHA"
+            gh release create "$tag" "$asset" --title "$title" --target "$GITHUB_SHA" --notes "Automated release for $GITHUB_SHA." --latest
           fi
