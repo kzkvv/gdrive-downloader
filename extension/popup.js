@@ -1,9 +1,21 @@
-import { downloadToBlob } from "./downloader.js";
+import {
+  DEFAULT_MAX_CHUNK_BYTES,
+  DEFAULT_NUM_CONNECTIONS,
+  downloadToBlob,
+} from "./downloader.js";
 import { mergeAV } from "./merger.js";
 
 const DEFAULT_NAME = "call";
 const FAST_CAPTURE_POLL_MS = 100;
 const STABLE_CAPTURE_POLL_MS = 1000;
+const MAX_ALLOWED_CHUNK_MB = 64;
+const MAX_ALLOWED_CONNECTIONS = 32;
+const MIN_ALLOWED_CHUNK_MB = 1;
+const MIN_ALLOWED_CONNECTIONS = 1;
+const STORAGE_KEYS = {
+  maxChunkBytes: "downloadMaxChunkBytes",
+  numConnections: "downloadNumConnections",
+};
 const DRIVE_QUALITY_LABELS = new Map([
   ["tiny", "144p"],
   ["small", "240p"],
@@ -39,16 +51,22 @@ const elements = {
   audioCard: document.getElementById("audioCard"),
   audioMeta: document.getElementById("audioMeta"),
   audioState: document.getElementById("audioState"),
+  chunkSizeMb: document.getElementById("chunkSizeMb"),
   closePanel: document.getElementById("closePanel"),
   copyLogs: document.getElementById("copyLogs"),
   downloadAudio: document.getElementById("downloadAudio"),
   downloadMerged: document.getElementById("downloadMerged"),
   downloadVideo: document.getElementById("downloadVideo"),
   log: document.getElementById("log"),
+  numConnections: document.getElementById("numConnections"),
   phase: document.getElementById("phase"),
   progressBar: document.getElementById("progressBar"),
   progressCopy: document.getElementById("progressCopy"),
   qualityHint: document.getElementById("qualityHint"),
+  resetSettings: document.getElementById("resetSettings"),
+  saveSettings: document.getElementById("saveSettings"),
+  settingsStatus: document.getElementById("settingsStatus"),
+  stopJob: document.getElementById("stopJob"),
   summary: document.getElementById("summary"),
   videoCard: document.getElementById("videoCard"),
   videoMeta: document.getElementById("videoMeta"),
@@ -61,9 +79,15 @@ let capture = null;
 let baseName = DEFAULT_NAME;
 let capturePollTimer = null;
 let capturePollInFlight = false;
+let downloadSettings = {
+  maxChunkBytes: DEFAULT_MAX_CHUNK_BYTES,
+  numConnections: DEFAULT_NUM_CONNECTIONS,
+};
 let lastCaptureSnapshot = "";
+let lastDiagnosticsSnapshot = "";
 let pollMode = "fast";
 let selectedVideoKey = "";
+let activeJobController = null;
 
 function formatBytes(bytes) {
   if (!bytes) {
@@ -75,6 +99,14 @@ function formatBytes(bytes) {
   }
 
   return `${(bytes / 1e6).toFixed(1)} MB`;
+}
+
+function formatChunkSizeMb(bytes) {
+  return Math.round(bytes / (1024 * 1024));
+}
+
+function formatSettingsSummary(settings = downloadSettings) {
+  return `${settings.numConnections} parallel connections, ${formatChunkSizeMb(settings.maxChunkBytes)} MB chunks`;
 }
 
 function timestamp() {
@@ -112,6 +144,144 @@ function addLog(message) {
 
   const stamp = new Date().toLocaleTimeString("en-US", { hour12: false });
   elements.log.textContent = `[${stamp}] ${message}\n${elements.log.textContent}`.trim();
+}
+
+function createAbortError(message = "Current job stopped.") {
+  return new DOMException(message, "AbortError");
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError" || error?.message === "called FFmpeg.terminate()";
+}
+
+function setSettingsStatus(message) {
+  elements.settingsStatus.textContent = message;
+}
+
+function updateStopButton() {
+  elements.stopJob.hidden = !busy;
+  elements.stopJob.disabled = !busy || !activeJobController || activeJobController.signal.aborted;
+}
+
+function normalizeInt(value, fallback, min, max) {
+  const parsed = Number.parseInt(`${value ?? ""}`, 10);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(parsed, min), max);
+}
+
+function normalizeSavedSettings(raw = {}) {
+  return {
+    maxChunkBytes: normalizeInt(
+      raw.maxChunkBytes,
+      DEFAULT_MAX_CHUNK_BYTES,
+      MIN_ALLOWED_CHUNK_MB * 1024 * 1024,
+      MAX_ALLOWED_CHUNK_MB * 1024 * 1024,
+    ),
+    numConnections: normalizeInt(
+      raw.numConnections,
+      DEFAULT_NUM_CONNECTIONS,
+      MIN_ALLOWED_CONNECTIONS,
+      MAX_ALLOWED_CONNECTIONS,
+    ),
+  };
+}
+
+function parseSettingsForm() {
+  const numConnections = Number.parseInt(elements.numConnections.value, 10);
+  const chunkSizeMb = Number.parseInt(elements.chunkSizeMb.value, 10);
+
+  if (!Number.isFinite(numConnections)
+    || numConnections < MIN_ALLOWED_CONNECTIONS
+    || numConnections > MAX_ALLOWED_CONNECTIONS) {
+    throw new Error(`Parallel connections must be between ${MIN_ALLOWED_CONNECTIONS} and ${MAX_ALLOWED_CONNECTIONS}.`);
+  }
+
+  if (!Number.isFinite(chunkSizeMb)
+    || chunkSizeMb < MIN_ALLOWED_CHUNK_MB
+    || chunkSizeMb > MAX_ALLOWED_CHUNK_MB) {
+    throw new Error(`Chunk size must be between ${MIN_ALLOWED_CHUNK_MB} and ${MAX_ALLOWED_CHUNK_MB} MB.`);
+  }
+
+  return {
+    maxChunkBytes: chunkSizeMb * 1024 * 1024,
+    numConnections,
+  };
+}
+
+function renderSettings() {
+  elements.numConnections.value = `${downloadSettings.numConnections}`;
+  elements.chunkSizeMb.value = `${formatChunkSizeMb(downloadSettings.maxChunkBytes)}`;
+  setSettingsStatus(`Current: ${formatSettingsSummary()}.`);
+}
+
+function setSettingsControlsDisabled(disabled) {
+  elements.numConnections.disabled = disabled;
+  elements.chunkSizeMb.disabled = disabled;
+  elements.saveSettings.disabled = disabled;
+  elements.resetSettings.disabled = disabled;
+}
+
+function storageGet(keys) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get(keys, (items) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      resolve(items);
+    });
+  });
+}
+
+function storageSet(items) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.set(items, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+async function loadDownloadSettings() {
+  const stored = await storageGet([STORAGE_KEYS.numConnections, STORAGE_KEYS.maxChunkBytes]);
+
+  downloadSettings = normalizeSavedSettings({
+    maxChunkBytes: stored[STORAGE_KEYS.maxChunkBytes],
+    numConnections: stored[STORAGE_KEYS.numConnections],
+  });
+
+  renderSettings();
+  addLog(`Download settings loaded: ${formatSettingsSummary()}.`);
+}
+
+async function saveDownloadSettings(nextSettings) {
+  downloadSettings = normalizeSavedSettings(nextSettings);
+
+  await storageSet({
+    [STORAGE_KEYS.maxChunkBytes]: downloadSettings.maxChunkBytes,
+    [STORAGE_KEYS.numConnections]: downloadSettings.numConnections,
+  });
+
+  renderSettings();
+}
+
+async function resetDownloadSettings() {
+  await saveDownloadSettings({
+    maxChunkBytes: DEFAULT_MAX_CHUNK_BYTES,
+    numConnections: DEFAULT_NUM_CONNECTIONS,
+  });
+
+  setSettingsStatus(`Defaults restored: ${formatSettingsSummary()}.`);
+  addLog(`Download settings reset to defaults: ${formatSettingsSummary()}.`);
 }
 
 function videoKey(stream) {
@@ -251,6 +421,34 @@ function describeCaptureState(nextCapture) {
     `videoQualities=${availableVideos(nextCapture).length}`,
     `updatedAt=${nextCapture.updatedAt || 0}`,
   ].join(" | ");
+}
+
+function diagnosticsSnapshot(diagnostics) {
+  return JSON.stringify({
+    documentOrigins: diagnostics?.documentOrigins ?? [],
+    hosts: diagnostics?.hosts ?? [],
+    initiators: diagnostics?.initiators ?? [],
+  });
+}
+
+function logDiagnostics(diagnostics) {
+  const parts = [];
+
+  if (diagnostics?.hosts?.length) {
+    parts.push(`hosts=${diagnostics.hosts.join(", ")}`);
+  }
+
+  if (diagnostics?.initiators?.length) {
+    parts.push(`initiators=${diagnostics.initiators.join(", ")}`);
+  }
+
+  if (diagnostics?.documentOrigins?.length) {
+    parts.push(`documents=${diagnostics.documentOrigins.join(", ")}`);
+  }
+
+  if (parts.length) {
+    addLog(`Observed videoplayback origins: ${parts.join(" | ")}`);
+  }
 }
 
 function captureSnapshot(nextCapture, tabId, tabUrl) {
@@ -460,6 +658,8 @@ function setBusy(nextBusy) {
   refreshButtons();
   elements.closePanel.disabled = busy;
   elements.copyLogs.disabled = false;
+  setSettingsControlsDisabled(busy);
+  updateStopButton();
 }
 
 function sendMessage(message) {
@@ -504,16 +704,27 @@ async function saveBlob(blob, filename) {
 }
 
 async function runJob(job) {
+  const controller = new AbortController();
+  activeJobController = controller;
   setBusy(true);
 
   try {
-    await job();
+    await job(controller.signal);
   } catch (error) {
-    addLog(`ERROR: ${error.message}`);
-    setSummary(error.message);
+    if (isAbortError(error)) {
+      addLog("Stopped current job.");
+      setSummary("Current job stopped.");
+    } else {
+      addLog(`ERROR: ${error.message}`);
+      setSummary(error.message);
+    }
   } finally {
+    if (activeJobController === controller) {
+      activeJobController = null;
+    }
     setBusy(false);
     hideProgress();
+    setSettingsStatus(`Current: ${formatSettingsSummary()}.`);
   }
 }
 
@@ -533,6 +744,8 @@ async function refreshCapture({ silent = false } = {}) {
   capture = response?.capture ?? null;
   const snapshot = captureSnapshot(capture, response?.tabId, response?.tabUrl);
   const changed = snapshot !== lastCaptureSnapshot;
+  const diagnostics = response?.diagnostics ?? null;
+  const diagnosticsChanged = diagnosticsSnapshot(diagnostics) !== lastDiagnosticsSnapshot;
   const ready = captureReady(capture);
 
   if (!silent || changed) {
@@ -549,6 +762,11 @@ async function refreshCapture({ silent = false } = {}) {
   if (changed) {
     logCaptureTransition(previousCapture, capture);
     lastCaptureSnapshot = snapshot;
+  }
+
+  if (diagnosticsChanged) {
+    logDiagnostics(diagnostics);
+    lastDiagnosticsSnapshot = diagnosticsSnapshot(diagnostics);
   }
 
   if (ready && pollMode !== "stable") {
@@ -606,11 +824,11 @@ async function closeSidePanel() {
 }
 
 elements.downloadAudio.addEventListener("click", () => {
-  void runJob(async () => {
-    addLog("Downloading audio stream...");
+  void runJob(async (signal) => {
+    addLog(`Downloading audio stream using ${formatSettingsSummary()}...`);
     const audioBlob = await downloadToBlob(capture.audio.url, (done, total) => {
       showProgress("Audio download", done, total);
-    });
+    }, downloadSettings, { signal });
 
     await saveBlob(audioBlob, makeFilename(".m4a"));
     addLog("Saved audio track.");
@@ -618,17 +836,17 @@ elements.downloadAudio.addEventListener("click", () => {
 });
 
 elements.downloadVideo.addEventListener("click", () => {
-  void runJob(async () => {
+  void runJob(async (signal) => {
     const video = selectedVideo();
 
     if (!video) {
       throw new Error("No video quality is selected.");
     }
 
-    addLog(`Downloading video stream (${displayQualityLabel(video)})...`);
+    addLog(`Downloading video stream (${displayQualityLabel(video)}) using ${formatSettingsSummary()}...`);
     const videoBlob = await downloadToBlob(video.url, (done, total) => {
       showProgress("Video download", done, total);
-    });
+    }, downloadSettings, { signal });
 
     await saveBlob(videoBlob, makeFilename("_video-only.mp4"));
     addLog(`Saved video track (${displayQualityLabel(video)}).`);
@@ -636,22 +854,22 @@ elements.downloadVideo.addEventListener("click", () => {
 });
 
 elements.downloadMerged.addEventListener("click", () => {
-  void runJob(async () => {
+  void runJob(async (signal) => {
     const video = selectedVideo();
 
     if (!video) {
       throw new Error("No video quality is selected.");
     }
 
-    addLog(`Downloading video stream (${displayQualityLabel(video)})...`);
+    addLog(`Downloading video stream (${displayQualityLabel(video)}) using ${formatSettingsSummary()}...`);
     const videoBlob = await downloadToBlob(video.url, (done, total) => {
       showProgress("Video download", done, total);
-    });
+    }, downloadSettings, { signal });
 
-    addLog("Downloading audio stream...");
+    addLog(`Downloading audio stream using ${formatSettingsSummary()}...`);
     const audioBlob = await downloadToBlob(capture.audio.url, (done, total) => {
       showProgress("Audio download", done, total);
-    });
+    }, downloadSettings, { signal });
 
     addLog("Merging with ffmpeg.wasm...");
     showIndeterminate("Muxing", "ffmpeg.wasm is working...");
@@ -663,6 +881,7 @@ elements.downloadMerged.addEventListener("click", () => {
         elements.progressBar.value = Math.max(0, Math.min(progress * 100, 100));
         setProgressLabel("Muxing", `${(progress * 100).toFixed(1)}%`);
       },
+      signal,
     });
 
     await saveBlob(mergedBlob, makeFilename(".mp4"));
@@ -682,6 +901,17 @@ elements.closePanel.addEventListener("click", () => {
   });
 });
 
+elements.stopJob.addEventListener("click", () => {
+  if (!activeJobController || activeJobController.signal.aborted) {
+    return;
+  }
+
+  addLog("Stopping current job...");
+  setSummary("Stopping current job...");
+  activeJobController.abort(createAbortError());
+  updateStopButton();
+});
+
 elements.videoQuality.addEventListener("change", () => {
   selectedVideoKey = elements.videoQuality.value;
   const video = selectedVideo();
@@ -693,18 +923,59 @@ elements.videoQuality.addEventListener("change", () => {
   renderCapture();
 });
 
-hideProgress();
-setBusy(false);
-addLog(`Auto-detect is active. Polling every ${FAST_CAPTURE_POLL_MS} ms until streams appear.`);
+elements.numConnections.addEventListener("input", () => {
+  setSettingsStatus("Unsaved settings changes.");
+});
 
-void refreshCapture()
-  .catch((error) => {
+elements.chunkSizeMb.addEventListener("input", () => {
+  setSettingsStatus("Unsaved settings changes.");
+});
+
+elements.saveSettings.addEventListener("click", () => {
+  void (async () => {
+    try {
+      const nextSettings = parseSettingsForm();
+      await saveDownloadSettings(nextSettings);
+      setSettingsStatus(`Saved: ${formatSettingsSummary()}.`);
+      addLog(`Download settings saved: ${formatSettingsSummary()}.`);
+    } catch (error) {
+      setSettingsStatus(error.message);
+      addLog(`ERROR: ${error.message}`);
+    }
+  })();
+});
+
+elements.resetSettings.addEventListener("click", () => {
+  void resetDownloadSettings().catch((error) => {
+    setSettingsStatus(error.message);
+    addLog(`ERROR: ${error.message}`);
+  });
+});
+
+async function initialize() {
+  hideProgress();
+  setBusy(false);
+  renderSettings();
+  addLog(`Auto-detect is active. Polling every ${FAST_CAPTURE_POLL_MS} ms until streams appear.`);
+
+  try {
+    await loadDownloadSettings();
+  } catch (error) {
+    setSettingsStatus("Could not load saved download settings.");
+    addLog(`ERROR: ${error.message}`);
+  }
+
+  try {
+    await refreshCapture();
+  } catch (error) {
     addLog(`ERROR: ${error.message}`);
     setSummary("Could not read captured Drive streams from the background worker.");
-  })
-  .finally(() => {
+  } finally {
     scheduleCapturePoll();
-  });
+  }
+}
+
+void initialize();
 
 window.addEventListener("beforeunload", () => {
   clearCapturePollTimer();

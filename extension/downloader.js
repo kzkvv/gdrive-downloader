@@ -1,5 +1,15 @@
-const NUM_CONNECTIONS = 32;
-const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_NUM_CONNECTIONS = 4;
+export const DEFAULT_MAX_CHUNK_BYTES = 8 * 1024 * 1024;
+
+function createAbortError() {
+  return new DOMException("Download stopped.", "AbortError");
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : createAbortError();
+  }
+}
 
 function detectMime(url) {
   const mime = new URL(url).searchParams.get("mime");
@@ -18,10 +28,30 @@ function parseTotalSize(response, url) {
   return Number.parseInt(fallback, 10) || 0;
 }
 
-async function probeSize(url) {
+function normalizeInt(value, fallback, min, max) {
+  const parsed = Number.parseInt(`${value ?? ""}`, 10);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(parsed, min), max);
+}
+
+function normalizeDownloadSettings(settings = {}) {
+  return {
+    maxChunkBytes: normalizeInt(settings.maxChunkBytes, DEFAULT_MAX_CHUNK_BYTES, 1, 64 * 1024 * 1024),
+    numConnections: normalizeInt(settings.numConnections, DEFAULT_NUM_CONNECTIONS, 1, 32),
+  };
+}
+
+async function probeSize(url, signal) {
+  throwIfAborted(signal);
+
   const response = await fetch(url, {
     cache: "no-store",
     headers: { Range: "bytes=0-0" },
+    signal,
   });
 
   if (!response.ok) {
@@ -38,12 +68,15 @@ async function probeSize(url) {
     }
   }
 
+  throwIfAborted(signal);
   return total;
 }
 
-async function streamIntoBuffer(response, target, startOffset, updateProgress) {
+async function streamIntoBuffer(response, target, startOffset, updateProgress, signal) {
   if (!response.body) {
+    throwIfAborted(signal);
     const data = new Uint8Array(await response.arrayBuffer());
+    throwIfAborted(signal);
     target.set(data, startOffset);
     updateProgress(data.byteLength);
     return;
@@ -53,20 +86,23 @@ async function streamIntoBuffer(response, target, startOffset, updateProgress) {
   let writeOffset = startOffset;
 
   while (true) {
+    throwIfAborted(signal);
     const { done, value } = await reader.read();
 
     if (done) {
       return;
     }
 
+    throwIfAborted(signal);
     target.set(value, writeOffset);
     writeOffset += value.byteLength;
     updateProgress(value.byteLength);
   }
 }
 
-export async function downloadToBlob(url, onProgress) {
-  const total = await probeSize(url);
+export async function downloadToBlob(url, onProgress, settings = {}, { signal } = {}) {
+  const { maxChunkBytes, numConnections } = normalizeDownloadSettings(settings);
+  const total = await probeSize(url, signal);
 
   if (!total) {
     throw new Error("Could not determine file size.");
@@ -74,10 +110,10 @@ export async function downloadToBlob(url, onProgress) {
 
   const ranges = [];
 
-  for (let start = 0; start < total; start += MAX_CHUNK_BYTES) {
+  for (let start = 0; start < total; start += maxChunkBytes) {
     ranges.push({
       start,
-      end: Math.min(start + MAX_CHUNK_BYTES - 1, total - 1),
+      end: Math.min(start + maxChunkBytes - 1, total - 1),
     });
   }
 
@@ -91,9 +127,11 @@ export async function downloadToBlob(url, onProgress) {
   };
 
   async function fetchRange({ start, end }) {
+    throwIfAborted(signal);
     const response = await fetch(url, {
       cache: "no-store",
       headers: { Range: `bytes=${start}-${end}` },
+      signal,
     });
 
     const fullRange = start === 0 && end === total - 1;
@@ -102,11 +140,12 @@ export async function downloadToBlob(url, onProgress) {
       throw new Error(`Range ${start}-${end} failed with HTTP ${response.status}`);
     }
 
-    await streamIntoBuffer(response, buffer, start, updateProgress);
+    await streamIntoBuffer(response, buffer, start, updateProgress, signal);
   }
 
-  const workers = Array.from({ length: Math.min(NUM_CONNECTIONS, ranges.length) }, async () => {
+  const workers = Array.from({ length: Math.min(numConnections, ranges.length) }, async () => {
     while (true) {
+      throwIfAborted(signal);
       const currentIndex = nextIndex;
       nextIndex += 1;
 

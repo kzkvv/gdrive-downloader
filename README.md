@@ -58,21 +58,36 @@ If you want a build from a workflow run that was not published as a release:
 3. Start playback in the Drive player.
 4. Wait until the extension captures audio and at least one video stream.
 5. If you want a different quality, change quality in the Drive player and keep the side panel open.
-6. Choose the captured quality in the `Video quality` selector.
-7. Click one of:
+6. If needed, open `Download settings` and adjust parallel connections or chunk size.
+7. Choose the captured quality in the `Video quality` selector.
+8. Click one of:
 
    - `Audio only`
    - `Video only`
    - `Download merged MP4`
+9. If you need to stop an active download or merge, click `Stop` in the progress panel.
 
 ## Notes
 
 - The side panel keeps polling while it is open, so you can open it before starting playback.
 - The quality selector only shows video qualities that the Drive player has already requested in the current tab.
+- Download settings are available in a collapsed panel; defaults are `4` parallel connections and `8 MB` chunks.
+- Active downloads and merges can be stopped from the progress panel.
 - Merging is done in-browser with `ffmpeg.wasm`, so large files can use a lot of RAM.
 - If you close the side panel during a download or merge, the current job stops.
 - `extension/ffmpeg/` is generated during build and should not be edited manually.
 - `dist/drive-video-downloader/` is the folder to load into Chrome.
+
+## Technical Details
+
+Why the Origin/Referer rewrite?
+Google Drive's own video player already sends `Origin: https://youtube.googleapis.com` and `Referer: https://youtube.googleapis.com/` on its media fetch requests — this is Drive's own behavior, not something invented here. When the extension fetches the same URLs directly, the request arrives from a different origin and Google's servers respond with a `403` or severely throttled bandwidth. `rules.json` replicates the exact same header shape Drive already uses, so the server treats the extension's requests the same way it treats the player's requests. The rule is narrowly scoped: it only applies to `media` and `xmlhttprequest` resource types matching `/videoplayback` on `googlevideo.com` and `c.drive.google.com`. No other traffic is affected.
+
+## Legal Disclaimer
+
+- This project is provided for personal use only.
+- You are responsible for making sure your use of this extension complies with Google Drive policies, Google's Terms of Service, copyright law, and any other rules that apply to the content you access.
+- Do not use this project to download, copy, or redistribute content unless you have the right to do so.
 
 ## Requirements
 
@@ -172,5 +187,3 @@ In IntelliJ IDEA, open the run configurations dropdown and choose `Build Extensi
 ## License
 
 This repository is licensed under `GPL-3.0-only`.
-
-That is intentional: `Apache-2.0` would allow proprietary forks, but `GPL-3.0` matches your goal of keeping redistributed forks open-source.

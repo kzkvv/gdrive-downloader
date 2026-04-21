@@ -8,10 +8,16 @@
     "declarativeNetRequestWithHostAccess",
     "downloads",
     "sidePanel",
+    "storage",
     "webRequest"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://youtube.googleapis.com/*",
+    "https://*.googlevideo.com/*",
+    "https://*.c.drive.google.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://drive.google.com/*",
+    "https://*.drive.google.com/*"
   ],
   "background": {
     "service_worker": "background.js"
